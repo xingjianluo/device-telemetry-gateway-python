@@ -97,6 +97,48 @@ curl -X POST http://127.0.0.1:8000/commands \
 
 若设备在线，同一结果会以 `{"type":"command_result", ...}` 推送到其 WebSocket。
 
+#### 2.4.1 事后查询指令状态 `GET /commands/{command_id}`
+
+指令提交后，可随时凭 `command_id` 查询其**稳定终态**，反复查询结论一致：
+
+```bash
+curl http://127.0.0.1:8000/commands/c-1
+# 成功
+# { "command_id":"c-1", "found":true, "device_id":"device-001",
+#   "name":"reboot", "status":"succeeded", "response": {...} }
+# 被拒绝（含原因）
+# { ..., "status":"rejected", "error":{"reason":"COMMAND_UNSUPPORTED", ...} }
+# 从未提交过（或已超保留窗口被彻底清理）
+# HTTP 404 { "found":false,
+#   "error":{"reason":"COMMAND_NOT_FOUND","detail":"..."} }
+```
+
+- 成功 / 被拒绝（各原因码） / 被取消 / 无此号，四类答复**相互可区分**。
+- 被拒绝的提交（鉴权失败、队列满、容量到顶等）也会在保留窗口内留痕可查；
+  重复提交同号查到的是首条结论，查询本身不会被标成 `duplicate`。
+
+#### 2.4.2 撤销未开始执行的指令 `POST /commands/{command_id}/cancel`
+
+```bash
+curl -X POST http://127.0.0.1:8000/commands/c-1/cancel
+# 排队中，撤销成功：      200 {"status":"canceled","canceled":true,"idempotent":false}
+# 重复撤销（幂等）：       200 {"status":"canceled","canceled":true,"idempotent":true}
+# 已开始执行/已完成：      409 {"canceled":false,
+#                              "error":{"reason":"COMMAND_CANCEL_TOO_LATE", ...}}
+# 未知指令号：            404 {"canceled":false,
+#                              "error":{"reason":"COMMAND_NOT_FOUND", ...}}
+```
+
+- 只有**尚未开始执行**（排队中 `pending`）的指令能撤销；
+- 撤销在工作线程"取到指令、准备执行"的同一状态机判定上原子完成，
+  因此不可能出现一条指令**既被取消又被执行**；被取消的指令被直接跳过，
+  **同一台设备其它指令的先后顺序不受影响**；
+- 状态只有前向流转（见 §4.5），不会从已完成退回未完成。
+
+#### 2.4.3 容量与对账 `GET /commands-metrics/details`
+
+返回提交/受理/复用/各类拒绝/撤销/清理的累计计数，用于对账，恒等式见 §4.6。
+
 ### 2.5 拒绝原因码（全工程统一、可区分）
 
 | reason | 触发场景 |
@@ -120,6 +162,10 @@ curl -X POST http://127.0.0.1:8000/commands \
 | `COMMAND_HANDLER_ERROR` | 处理器抛异常（不影响串行循环） |
 | `COMMAND_QUEUE_FULL` | 设备积压超过有界上限 |
 | `COMMAND_DUPLICATE` | command_id 已被其它设备使用 |
+| `COMMAND_NOT_FOUND` | 查询/撤销了一个从未提交过（或已超窗遗忘）的指令号 |
+| `COMMAND_CANCELED` | 指令在开始执行前被撤销（终态） |
+| `COMMAND_CANCEL_TOO_LATE` | 指令已开始执行或已到终态，撤销被拒（HTTP 409） |
+| `COMMAND_STATUS_LIMIT` | 指令状态登记册到顶且没有可清理的终态 |
 
 ---
 
@@ -171,9 +217,77 @@ curl -X POST http://127.0.0.1:8000/commands \
 
 ### 4.4 有界积压
 
-- 队列容量 `max_queue` 可配（默认 16）。
+- 队列容量 `max_queue` 可配（默认 16，环境变量 `GATEWAY_MAX_QUEUE`）。
 - 在途 + 排队达到上限时，新的并发提交立即得到 `COMMAND_QUEUE_FULL`，
   **以可区分的拒绝替代无界堆积**，调用方可据此重试或告警。
+
+### 4.5 指令状态机与撤销
+
+每条指令在 `CommandRegistry` 中有单向状态，**不存在回退边**：
+
+```
+                 鉴权即拒 / 容量到顶
+   (提交) ───────────────────────────────▶ rejected(终态)
+     │
+     ▼
+  pending ──撤销成功──▶ canceled(终态)        # 唯一可撤销窗口：排队中
+     │                                       # 重复撤销 -> 幂等
+     │ 工作线程取到、准备执行（原子 CAS）
+     ▼
+ executing ─撤销──▶ COMMAND_CANCEL_TOO_LATE  # 窗口已关闭，拒绝撤销
+     │
+     ├──处理器成功──▶ succeeded(终态)
+     └──无处理器/抛异常─▶ rejected(终态, COMMAND_UNSUPPORTED /
+                                   COMMAND_HANDLER_ERROR)
+```
+
+要点：
+
+- **原子判定**：撤销与"开始执行"在同一把锁内竞争，结局互斥。被撤销的排队
+  指令由工作线程在 CAS 处发现并直接跳过——既不调用处理器，也不改变同设备
+  其它指令的 FIFO 顺序。
+- **终态稳定可查**：终态不可变，同一 `command_id` 反复查询结论一致；
+  提交者、并发重复提交者、事后查询者看到的是同一结论。
+- 已开始执行 / 已完成（`executing`/`succeeded`/`rejected`）的撤销请求一律
+  返回 `COMMAND_CANCEL_TOO_LATE`，状态绝不从已完成退回。
+
+### 4.6 有界容量、清理规则与对账
+
+网关长时间不重启，指令状态不能只进不出。`CommandRegistry(max_records=...)`
+（默认 4096，环境变量 `GATEWAY_MAX_STATUS_RECORDS`）给出**明确上限**：
+
+1. **只清理终态**：`pending`/`executing` 等未结束指令永远不会被当成不存在，
+   因此清理不会导致同一条指令被重复执行，也不会让等待者丢结论。
+2. **两级回收（按首次提交先后，最旧优先，规则确定可解释）**：
+   - 完整记录数到顶时，把**最旧的终态完整记录压缩成墓碑（tombstone）**：
+     只保留"指令号 → 可区分结论（含成功/拒绝/取消原因）"，丢弃响应体；
+     墓碑仍占去重窗口，窗口内同号重复提交照样幂等、不二次执行。
+   - 墓碑也到上限时，**最旧墓碑被彻底遗忘**；此后再查该号得到明确的
+     `COMMAND_NOT_FOUND`（与"从未提交"同一可区分答复，不含糊）。
+3. **到顶该拒就拒**：若占满容量的全是未结束指令（没有任何终态可清理），
+   新提交立即得到 `COMMAND_STATUS_LIMIT`，绝不无界增长、绝不误删在途指令。
+   （容量上限按在途指令规模配置；正常业务下终态随时可回收。）
+
+对账（`GET /commands-metrics/details`，代码中 `check_command_invariants()` 断言）：
+
+- **提交账**：`submitted == accepted + reused_duplicate
+  + rejected_device_unknown + rejected_unauthorized
+  + rejected_duplicate + rejected_status_limit`
+- **受理账**：`accepted == 当前未结束数 + succeeded + canceled
+  + queue_full + unsupported + handler_error`
+  （`COMMAND_QUEUE_FULL` 是"已受理但设备 FIFO 放不下"，故计入 accepted 后落终态）
+- **容量账**：完整记录数、墓碑数恒不超过上限；墓碑里只有终态。
+
+### 4.7 与上一轮行为的兼容关系
+
+- 分片重组、乱序/重复去重、残缺 `FRAGMENT_GAP`、断线重连续传、版本兼容、
+  连接身份校验等**上报链路完全未改动**（既有测试全部保留）。
+- 指令仍为"每设备 FIFO 串行 + 全局 `command_id` 幂等 + 有界队列"；
+  变化只是把原先"提交完即丢"的指令结果改为**在有界登记册中保留终态**，
+  并新增查询 / 撤销 / 容量对账。`POST /commands` 的请求体、成功与
+  `COMMAND_*` 拒绝响应结构保持不变；新增的 `canceled` 状态同样以 HTTP 200
+  返回（它是一个明确终态而非错误），真正的拒绝仍为 403、撤销冲突为 409、
+  无此号为 404。
 
 ---
 
@@ -187,22 +301,31 @@ curl -X POST http://127.0.0.1:8000/commands \
 | 版本差异 | 可选忽略、必填拒绝、未知必填拒绝、缺省随版本可复现 |
 | 越权下发 | 入队前按授权表拒绝，原因独立 |
 | 并发下发 | 每设备串行保序 + command_id 幂等 + 有界积压拒绝 |
+| 事后追溯 | 终态在有界登记册保留，凭 command_id 稳定查询，无此号明确 NOT_FOUND |
+| 撤销指令 | 仅 pending 可撤销且幂等；与开始执行原子竞争，不重复执行、不乱序、不回退 |
+| 长期容量 | 终态"压缩墓碑→超窗遗忘"有界回收；只清终态；全在途时 STATUS_LIMIT；账可对平 |
 
 ---
 
 ## 6. 本地验证
 
 ```bash
-# 全部单测（含分片/去重/续传/版本/鉴权/并发 + WebSocket/HTTP 集成测试）
+# 全部单测（分片/去重/续传/版本/鉴权/并发 + 查询/撤销/容量 + WS/HTTP 集成）
 uv run python -m unittest discover -s tests -v
 
-# 仅核心网关
+# 仅新增的指令生命周期（查询/撤销/容量对账）——确定性并发，约 0.01s
+uv run python -m unittest tests.test_command_lifecycle -v
+# 仅核心网关（含上一轮并发/串行/跨设备）
 uv run python -m unittest tests.test_gateway -v
-# 仅传输层
+# 仅传输层（含新增 GET 查询 / cancel / metrics 端点）
 uv run python -m unittest tests.test_transport -v
 
 # 编译检查
 uv run python -m compileall main.py gateway tests
+
+# 容量上限的环境变量验证
+GATEWAY_MAX_QUEUE=2 GATEWAY_MAX_STATUS_RECORDS=4 \
+  uv run uvicorn main:app --port 8000
 ```
 
 单测在每个用例中打印三项内容，便于审计：
@@ -243,9 +366,10 @@ gateway/
   reassembly.py  # 分片乱序重组/去重/残缺中止（线程安全）
   telemetry.py   # 版本兼容、必填/未知必填校验、缺省归一化
   session.py     # 会话与已确认序列号（续传游标）
-  commands.py    # 鉴权、每设备串行队列、幂等去重、有界积压
-  gateway.py     # 门面：去重落库 + 续传 + 指令下发
-  app.py         # FastAPI：WebSocket / HTTP 传输层
-main.py          # 默认授权表与处理器装配
-tests/           # 15 个单测（核心 13 + 传输层 2）
+  registry.py    # 指令状态机 + 有界登记册：查询/撤销/墓碑回收/容量对账
+  commands.py    # 鉴权、每设备串行队列、幂等去重、有界积压、查询与撤销
+  gateway.py     # 门面：去重落库 + 续传 + 指令下发/查询/撤销/对账
+  app.py         # FastAPI：WebSocket / HTTP 传输层（含 query/cancel/metrics）
+main.py          # 默认授权表、处理器与容量上限的装配（支持环境变量）
+tests/           # 28 个单测（核心 23 + 传输层 5）
 ```

@@ -10,7 +10,12 @@ from fastapi.responses import JSONResponse
 
 from gateway.commands import Command
 from gateway.gateway import Gateway
-from gateway.protocol import ParseError, parse_fragment_header, parse_frame
+from gateway.protocol import (
+    R_COMMAND_NOT_FOUND,
+    ParseError,
+    parse_fragment_header,
+    parse_frame,
+)
 
 
 class ConnectionRegistry:
@@ -103,7 +108,67 @@ def create_app(gateway: Gateway) -> FastAPI:
         await registry.send(
             command.device_id, {"type": "command_result", **body}
         )
-        return JSONResponse(status_code=200 if result.status == "ok" else 403, content=body)
+        return JSONResponse(
+            status_code=200 if result.status in ("ok", "canceled") else 403,
+            content=body,
+        )
+
+    @app.get("/commands/{command_id}")
+    async def query_command(command_id: str) -> JSONResponse:
+        """事后查询指令终态：成功/被拒/被取消结论可区分；无此号给 404+NOT_FOUND。"""
+        view = await asyncio.to_thread(gateway.query_command, command_id)
+        if view is None:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "command_id": command_id,
+                    "found": False,
+                    "error": {"reason": R_COMMAND_NOT_FOUND,
+                              "detail": "command_id never submitted or already aged out"},
+                },
+            )
+        body: dict[str, Any] = {
+            "command_id": view.command_id,
+            "found": True,
+            "device_id": view.device_id,
+            "name": view.name,
+            "status": view.status,
+        }
+        if view.reason is not None:
+            body["error"] = view.reason.to_dict()
+        if view.response is not None:
+            body["response"] = view.response
+        return JSONResponse(status_code=200, content=body)
+
+    @app.post("/commands/{command_id}/cancel")
+    async def cancel_command(command_id: str) -> JSONResponse:
+        """撤销尚未开始执行的指令；重复撤销幂等。"""
+        result = await asyncio.to_thread(gateway.cancel_command, command_id)
+        if result.idempotent:
+            # 此前已撤销：幂等成功，结论与首次一致
+            return JSONResponse(status_code=200, content={
+                "command_id": command_id, "status": "canceled",
+                "canceled": True, "idempotent": True,
+            })
+        if result.canceled:
+            return JSONResponse(status_code=200, content={
+                "command_id": command_id, "status": "canceled",
+                "canceled": True, "idempotent": False,
+            })
+        assert result.reason is not None
+        status_code = 404 if result.reason.reason == R_COMMAND_NOT_FOUND else 409
+        return JSONResponse(
+            status_code=status_code,
+            content={
+                "command_id": command_id, "canceled": False,
+                "error": result.reason.to_dict(),
+            },
+        )
+
+    @app.get("/commands-metrics/details")
+    async def command_metrics() -> dict[str, Any]:
+        """容量与受理对账计数：submitted == accepted + reused + 各类受理前拒绝。"""
+        return gateway.command_metrics()
 
     @app.websocket("/ws/{device_id}")
     async def device_ws(ws: WebSocket, device_id: str) -> None:

@@ -15,6 +15,7 @@ from gateway.protocol import (
     ParseError,
 )
 from gateway.reassembly import Reassembler
+from gateway.registry import CancelResult, CommandStatusView
 from gateway.session import DeviceSession
 from gateway.telemetry import TelemetryRecord, normalize_telemetry
 
@@ -164,3 +165,19 @@ class Gateway:
     # ---- 下行指令 ----
     def submit_command(self, command: Command) -> CommandResult:
         return self._executor.submit(command)
+
+    def query_command(self, command_id: str) -> CommandStatusView | None:
+        """事后查指令终态；未提交过/已超保留窗口返回 None（调用方给 NOT_FOUND）。"""
+        return self._executor.query(command_id)
+
+    def cancel_command(self, command_id: str) -> CancelResult:
+        """撤销尚未开始执行的指令（语义见 commands.CommandExecutor.cancel）。"""
+        return self._executor.cancel(command_id)
+
+    def command_metrics(self) -> dict[str, int]:
+        """容量上限与受理/拒绝的对账计数。"""
+        return self._executor.metrics()
+
+    def check_command_invariants(self) -> None:
+        """提交账==受理账==终态账、容量不超限的断言入口。"""
+        self._executor.check_invariants()
