@@ -5,6 +5,7 @@ import json
 import threading
 from dataclasses import dataclass, field
 
+from gateway.commandstore import CommandMetrics, CommandStatus
 from gateway.commands import Command, CommandExecutor, CommandResult
 from gateway.protocol import (
     R_DEVICE_UNKNOWN,
@@ -164,3 +165,12 @@ class Gateway:
     # ---- 下行指令 ----
     def submit_command(self, command: Command) -> CommandResult:
         return self._executor.submit(command)
+
+    def query_command(self, command_id: str) -> CommandStatus | ParseError:
+        return self._executor.query_status(command_id)
+
+    def cancel_command(self, command_id: str) -> CommandResult:
+        return self._executor.cancel(command_id)
+
+    def command_metrics(self) -> CommandMetrics:
+        return self._executor.metrics()

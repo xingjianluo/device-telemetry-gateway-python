@@ -1,20 +1,32 @@
-"""下行指令：鉴权、串行执行、有界积压、幂等去重。"""
+"""下行指令：鉴权、串行执行、有界积压、幂等去重、状态查询、取消与容量治理。"""
 from __future__ import annotations
 
+import logging
 import threading
 from dataclasses import dataclass, field
 from queue import Full, Queue
 from typing import Any, Callable
 
+from gateway.commandstore import (
+    BoundedCommandStore,
+    CommandMetrics,
+    CommandState,
+    CommandStatus,
+)
 from gateway.protocol import (
     R_COMMAND_DUPLICATE,
     R_COMMAND_HANDLER_ERROR,
+    R_COMMAND_NOT_CANCELLABLE,
+    R_COMMAND_NOT_FOUND,
     R_COMMAND_QUEUE_FULL,
+    R_COMMAND_RETIRED,
     R_COMMAND_UNAUTHORIZED,
     R_COMMAND_UNSUPPORTED,
     R_DEVICE_UNKNOWN,
     ParseError,
 )
+
+logger = logging.getLogger("gateway.commands")
 
 
 @dataclass(frozen=True)
@@ -28,10 +40,11 @@ class Command:
 @dataclass
 class CommandResult:
     command_id: str
-    status: str  # "ok" | "rejected"
+    status: str  # "ok" | "rejected" | "cancelled"
+    device_id: str = ""
     response: Any = None
     reason: ParseError | None = None
-    duplicate: bool = False  # True: 该 command_id 此前已处理过，本次未重复执行
+    duplicate: bool = False  # True: 该 command_id 此前已处理过，本次未重复执行/取消
 
 
 # 指令处理器：name -> handler(device_id, args) -> response
@@ -42,9 +55,38 @@ HandlerTable = dict[str, Callable[[str, dict[str, Any]], Any]]
 class _DeviceState:
     queue: "Queue[Command | None]"
     thread: threading.Thread
-    # 设备执行结果状态（由该设备的工作线程串行写入）
-    applied: dict[str, CommandResult] = field(default_factory=dict)
-    # 为保证严格提交顺序，pending 中的指令只登记 id；顺序由 Queue 本身保证
+    # 严格提交顺序由 Queue 本身保证；取消通过共享状态机标记，出队时跳过执行。
+
+
+def _reject(command_id: str, reason: ParseError, device_id: str = "") -> CommandResult:
+    return CommandResult(
+        command_id=command_id, status="rejected", device_id=device_id, reason=reason
+    )
+
+
+def _status_to_result(status: CommandStatus, duplicate: bool = False) -> CommandResult:
+    if status.state is CommandState.SUCCEEDED:
+        return CommandResult(
+            command_id=status.command_id,
+            status="ok",
+            device_id=status.device_id,
+            response=status.response,
+            duplicate=duplicate,
+        )
+    if status.state is CommandState.CANCELLED:
+        return CommandResult(
+            command_id=status.command_id,
+            status="cancelled",
+            device_id=status.device_id,
+            duplicate=duplicate,
+        )
+    return CommandResult(
+        command_id=status.command_id,
+        status="rejected",
+        device_id=status.device_id,
+        reason=status.reason,
+        duplicate=duplicate,
+    )
 
 
 class CommandExecutor:
@@ -53,7 +95,9 @@ class CommandExecutor:
     并发语义：
       * 每个设备一把串行队列 + 一个工作线程 => 同设备指令严格按提交顺序生效；
       * command_id 全局幂等 => 并发提交相同 command_id 只执行一次，无状态回退；
-      * 队列长度有界 => 积压超限返回 COMMAND_QUEUE_FULL，不做无界堆积。
+      * 队列长度有界 => 积压超限返回 COMMAND_QUEUE_FULL，不做无界堆积；
+      * 指令状态进入 BoundedCommandStore：可凭 command_id 查询、可取消尚未
+        开始执行者、终态按 FIFO 有界保留并以墓碑防止二次执行。
     """
 
     def __init__(
@@ -61,14 +105,17 @@ class CommandExecutor:
         authorizations: dict[str, frozenset[str]],
         handlers: HandlerTable,
         max_queue: int = 16,
+        max_history: int = 256,
+        max_retired: int = 4096,
     ) -> None:
         self._auth = authorizations
         self._handlers = handlers
         self._max_queue = max_queue
         self._devices: dict[str, _DeviceState] = {}
         self._lock = threading.Lock()
-        # command_id -> (完成事件, 归属设备, 结果占位)
-        self._inflight: dict[str, tuple[threading.Event, str, CommandResult | None]] = {}
+        self._store = BoundedCommandStore(
+            max_history=max_history, max_retired=max_retired
+        )
 
     # ------------------------------------------------------------------
     def _get_or_create_device_locked(self, device_id: str) -> _DeviceState:
@@ -88,111 +135,280 @@ class CommandExecutor:
         return state
 
     def _worker_loop(self, device_id: str, state: _DeviceState) -> None:
-        """单设备单线程：保证该设备指令串行生效、提交顺序即生效顺序。"""
+        """单设备单线程：保证该设备指令串行生效、提交顺序即生效顺序。
+
+        被取消的指令保留其队列位置（从而不打乱其它指令顺序），仅在轮到它时
+        跳过执行；状态 CANCELLED 由取消路径写入，这里绝不覆盖。
+        """
         while True:
             command = state.queue.get()
             try:
                 if command is None:
                     return
-                result = self._execute(command)
-                state.applied[command.command_id] = result
                 with self._lock:
-                    event, _owner, _placeholder = self._inflight[command.command_id]
-                    self._inflight[command.command_id] = (event, device_id, result)
+                    record = self._store.get(command.command_id)
+                    if record is None:
+                        # 防御性：记录不应在出队前消失（非终态不淘汰）
+                        logger.error(
+                            "worker dequeued command without record command_id=%s",
+                            command.command_id,
+                        )
+                        continue
+                    if record.state is not CommandState.QUEUED:
+                        if record.state is CommandState.CANCELLED:
+                            # 轮到它了：此刻才真正离开队列，允许进入终态淘汰序列
+                            self._store.retire_cancelled(record)
+                        else:
+                            logger.error(
+                                "worker dequeued command in unexpected state "
+                                "command_id=%s state=%s",
+                                command.command_id, record.state.value,
+                            )
+                        # 已取消：跳过执行，绝不回退状态、绝不二次执行
+                        logger.info(
+                            "worker skips command command_id=%s state=%s",
+                            command.command_id, record.state.value,
+                        )
+                        continue
+                    # RUNNING 标记在锁内完成；处理器在锁外执行（可能耗时，
+                    # 且提交方的入队判定不应被慢处理器阻塞）
+                    self._store.mark_running(record)
+                outcome = self._execute(command)
+                with self._lock:
+                    if outcome.status == "ok":
+                        self._store.finish_terminal(
+                            record, CommandState.SUCCEEDED, response=outcome.response
+                        )
+                    else:
+                        assert outcome.reason is not None
+                        self._store.finish_terminal(
+                            record, CommandState.FAILED, reason=outcome.reason
+                        )
             finally:
-                event.set()
                 state.queue.task_done()
 
     def _execute(self, command: Command) -> CommandResult:
         """鉴权已在提交时完成；这里只做分发执行与错误区分。"""
         handler = self._handlers.get(command.name)
         if handler is None:
-            return CommandResult(
+            return _reject(
                 command.command_id,
-                status="rejected",
-                reason=ParseError(
+                ParseError(
                     R_COMMAND_UNSUPPORTED,
                     f"command {command.name!r} has no handler",
                 ),
+                device_id=command.device_id,
             )
         try:
             response = handler(command.device_id, dict(command.args))
         except Exception as exc:  # 业务处理器异常不得破坏串行循环
-            return CommandResult(
+            return _reject(
                 command.command_id,
-                status="rejected",
-                reason=ParseError(
-                    R_COMMAND_HANDLER_ERROR, f"{type(exc).__name__}: {exc}"
-                ),
+                ParseError(R_COMMAND_HANDLER_ERROR, f"{type(exc).__name__}: {exc}"),
+                device_id=command.device_id,
             )
-        return CommandResult(command.command_id, status="ok", response=response)
+        return CommandResult(
+            command.command_id,
+            status="ok",
+            device_id=command.device_id,
+            response=response,
+        )
 
     # ------------------------------------------------------------------
     def submit(self, command: Command) -> CommandResult:
-        """提交并阻塞至该指令被串行执行完毕。"""
+        """提交并阻塞至该指令被串行执行完毕（或被取消）。
+
+        每个提交在锁内被归类为 accepted / duplicate / rejected 之一，对账恒平。
+        """
         device_id = command.device_id
-        allowed = self._auth.get(device_id)
-        if allowed is None:
-            return CommandResult(
-                command.command_id,
-                status="rejected",
-                reason=ParseError(R_DEVICE_UNKNOWN, f"device {device_id!r} is not registered"),
-            )
-        if command.name not in allowed:
-            return CommandResult(
-                command.command_id,
-                status="rejected",
-                reason=ParseError(
-                    R_COMMAND_UNAUTHORIZED,
-                    f"device {device_id!r} is not authorized for {command.name!r}",
-                ),
-            )
+        command_id = command.command_id
+
+        # 预校验（设备/授权）：不建立任何指令记录，仅计入提交与拒绝
+        with self._lock:
+            self._store.count_submission()
+            allowed = self._auth.get(device_id)
+            if allowed is None:
+                self._store.count_rejection(R_DEVICE_UNKNOWN)
+                logger.info(
+                    "command reject command_id=%s input=device=%s name=%s reason=%s",
+                    command_id, device_id, command.name, R_DEVICE_UNKNOWN,
+                )
+                return _reject(
+                    command_id,
+                    ParseError(R_DEVICE_UNKNOWN,
+                               f"device {device_id!r} is not registered"),
+                )
+            if command.name not in allowed:
+                self._store.count_rejection(R_COMMAND_UNAUTHORIZED)
+                logger.info(
+                    "command reject command_id=%s input=device=%s name=%s reason=%s",
+                    command_id, device_id, command.name, R_COMMAND_UNAUTHORIZED,
+                )
+                return _reject(
+                    command_id,
+                    ParseError(
+                        R_COMMAND_UNAUTHORIZED,
+                        f"device {device_id!r} is not authorized for "
+                        f"{command.name!r}",
+                    ),
+                )
 
         duplicate = False
+        record = None
         with self._lock:
-            entry = self._inflight.get(command.command_id)
-            if entry is not None:
-                # 并发/重复提交：等待首个提交的执行结果，本调用不重复执行
-                event, owner, _placeholder = entry
-                if owner != device_id:
-                    return CommandResult(
-                        command.command_id,
-                        status="rejected",
-                        reason=ParseError(
+            # 墓碑窗内复用：明确、可区分地拒绝，防止同一指令二次执行
+            tomb = self._store.retired_snapshot(command_id)
+            if tomb is not None:
+                self._store.count_rejection(R_COMMAND_RETIRED)
+                logger.info(
+                    "command reject command_id=%s input=device=%s name=%s reason=%s "
+                    "prior_state=%s",
+                    command_id, device_id, command.name, R_COMMAND_RETIRED,
+                    tomb.state.value,
+                )
+                return _reject(
+                    command_id,
+                    ParseError(
+                        R_COMMAND_RETIRED,
+                        f"command_id {command_id!r} already completed "
+                        f"({tomb.state.value}) and retired from the retention "
+                        "window",
+                    ),
+                    device_id=tomb.device_id,
+                )
+
+            record = self._store.get(command_id)
+            if record is not None:
+                if record.device_id != device_id:
+                    # 跨设备复用 command_id：拒绝，且不重复执行
+                    self._store.count_rejection(R_COMMAND_DUPLICATE)
+                    logger.info(
+                        "command reject command_id=%s input=device=%s name=%s "
+                        "reason=%s owner=%s",
+                        command_id, device_id, command.name,
+                        R_COMMAND_DUPLICATE, record.device_id,
+                    )
+                    return _reject(
+                        command_id,
+                        ParseError(
                             R_COMMAND_DUPLICATE,
                             "command_id already used by another device",
                         ),
+                        device_id=record.device_id,
                     )
+                # 并发/重复提交：等待首个提交的结论，本调用不重复执行
+                self._store.count_duplicate()
+                event = record.event
                 duplicate = True
             else:
-                event = threading.Event()
-                self._inflight[command.command_id] = (event, device_id, None)
                 state = self._get_or_create_device_locked(device_id)
                 try:
+                    # Queue 自身有界：max_queue 个排队槽 + 1 个已出队在途槽，
+                    # 即有效积压口径“在途 + 排队 <= max_queue + 1”，超限即拒绝。
                     state.queue.put_nowait(command)
                 except Full:
-                    del self._inflight[command.command_id]
-                    return CommandResult(
-                        command.command_id,
-                        status="rejected",
-                        reason=ParseError(
-                            R_COMMAND_QUEUE_FULL,
-                            f"backlog limit {self._max_queue} reached for {device_id!r}",
-                        ),
+                    self._store.count_rejection(R_COMMAND_QUEUE_FULL)
+                    logger.info(
+                        "command reject command_id=%s input=device=%s name=%s "
+                        "reason=%s limit=%d",
+                        command_id, device_id, command.name,
+                        R_COMMAND_QUEUE_FULL, self._max_queue,
                     )
+                    return _reject(
+                        command_id,
+                        ParseError(
+                            R_COMMAND_QUEUE_FULL,
+                            f"backlog limit {self._max_queue} reached for "
+                            f"{device_id!r}",
+                        ),
+                        device_id=device_id,
+                    )
+                # 入队成功才建立状态（QUEUED）并计入 accepted
+                record = self._store.create_queued(command_id, device_id, command.name)
+                event = record.event
 
         event.wait()
-        _, _, result = self._inflight[command.command_id]
-        assert result is not None
-        if duplicate:
-            result = CommandResult(
-                result.command_id,
-                status=result.status,
-                response=result.response,
-                reason=result.reason,
-                duplicate=True,
+        # 用本地持有的记录对象取结论：即使该 id 已被淘汰出保留窗/墓碑窗，
+        # 提交方仍能拿到自己这一单的确定结论（不依赖再次按 id 查表）。
+        assert record is not None
+        with self._lock:
+            final = self._store.snapshot_record(record)
+        logger.info(
+            "command settled command_id=%s device=%s state=%s duplicate=%s",
+            command_id, final.device_id, final.state.value, duplicate,
+        )
+        return _status_to_result(final, duplicate=duplicate)
+
+    # ------------------------------------------------------------------
+    # ---- 指令状态查询 / 取消 / 对账 ----
+    def query_status(self, command_id: str) -> CommandStatus | ParseError:
+        """凭指令号查询：同一 id 反复查询结论稳定一致；未提交过 -> NOT_FOUND。"""
+        with self._lock:
+            status = self._store.status(command_id)
+        if status is None:
+            logger.info(
+                "command query command_id=%s verdict=%s",
+                command_id, R_COMMAND_NOT_FOUND,
             )
-        return result
+            return ParseError(
+                R_COMMAND_NOT_FOUND,
+                f"command_id {command_id!r} has never been submitted",
+            )
+        logger.info(
+            "command query command_id=%s verdict=found state=%s retired=%s",
+            command_id, status.state.value, status.retired,
+        )
+        return status
+
+    def cancel(self, command_id: str) -> CommandResult:
+        """取消尚未开始执行的指令。
+
+        * QUEUED -> CANCELLED（成功）；重复取消幂等（duplicate=True）；
+        * RUNNING / SUCCEEDED / FAILED（含已淘汰墓碑）-> COMMAND_NOT_CANCELLABLE；
+        * 从未提交 -> COMMAND_NOT_FOUND；
+        * 取消仅做标记、保留队列位置，不改变同设备其它指令的先后。
+        """
+        with self._lock:
+            outcome = self._store.cancel(command_id)
+            if outcome is None:
+                logger.info(
+                    "command cancel command_id=%s verdict=%s",
+                    command_id, R_COMMAND_NOT_FOUND,
+                )
+                return _reject(
+                    command_id,
+                    ParseError(
+                        R_COMMAND_NOT_FOUND,
+                        f"command_id {command_id!r} has never been submitted",
+                    ),
+                )
+            status, was_duplicate = outcome
+            if status.state is CommandState.CANCELLED:
+                logger.info(
+                    "command cancel command_id=%s verdict=cancelled duplicate=%s",
+                    command_id, was_duplicate,
+                )
+                return _status_to_result(status, duplicate=was_duplicate)
+            # RUNNING 或已成功/失败（含墓碑）：明确拒绝并给出原因
+            logger.info(
+                "command cancel command_id=%s verdict=%s state=%s retired=%s",
+                command_id, R_COMMAND_NOT_CANCELLABLE,
+                status.state.value, status.retired,
+            )
+            return _reject(
+                command_id,
+                ParseError(
+                    R_COMMAND_NOT_CANCELLABLE,
+                    f"command is {status.state.value}"
+                    + (" (retired)" if status.retired else "")
+                    + ", only queued commands can be cancelled",
+                ),
+                device_id=status.device_id,
+            )
+
+    def metrics(self) -> CommandMetrics:
+        with self._lock:
+            return self._store.metrics_snapshot()
 
     def shutdown(self) -> None:
         with self._lock:

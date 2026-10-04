@@ -9,6 +9,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
 from gateway.commands import Command
+from gateway.commandstore import CommandStatus
 from gateway.gateway import Gateway
 from gateway.protocol import ParseError, parse_fragment_header, parse_frame
 
@@ -50,6 +51,21 @@ def _ingest_to_dict(result: Any) -> dict[str, Any]:
         body["error"] = result.error.to_dict()
     if result.record is not None:
         body["record"] = result.record.raw
+    return body
+
+
+def _status_to_dict(status: CommandStatus) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "command_id": status.command_id,
+        "state": status.state.value,
+        "device_id": status.device_id,
+        "name": status.name,
+        "retired": status.retired,
+    }
+    if status.response is not None:
+        body["response"] = status.response
+    if status.reason is not None:
+        body["error"] = status.reason.to_dict()
     return body
 
 
@@ -104,6 +120,47 @@ def create_app(gateway: Gateway) -> FastAPI:
             command.device_id, {"type": "command_result", **body}
         )
         return JSONResponse(status_code=200 if result.status == "ok" else 403, content=body)
+
+    @app.get("/commands/{command_id}")
+    async def query_command(command_id: str) -> JSONResponse:
+        """凭指令号查询最终/当前状态；查无此号给出明确可区分答复。"""
+        status = await asyncio.to_thread(gateway.query_command, command_id)
+        if isinstance(status, ParseError):
+            return JSONResponse(
+                status_code=404, content={"status": "rejected", "error": status.to_dict()}
+            )
+        return JSONResponse(status_code=200, content=_status_to_dict(status))
+
+    @app.post("/commands/{command_id}/cancel")
+    async def cancel_command(command_id: str) -> JSONResponse:
+        """取消尚未开始执行的指令；重复取消幂等。"""
+        result = await asyncio.to_thread(gateway.cancel_command, command_id)
+        body: dict[str, Any] = {
+            "command_id": result.command_id,
+            "status": result.status,
+            "duplicate": result.duplicate,
+        }
+        if result.response is not None:
+            body["response"] = result.response
+        if result.reason is not None:
+            body["error"] = result.reason.to_dict()
+        code = 200 if result.status in ("ok", "cancelled") else (
+            404
+            if result.reason is not None and result.reason.reason == "COMMAND_NOT_FOUND"
+            else 409
+        )
+        # 取消若已归属某台设备，尽力把取消结论推送给在线设备
+        if result.device_id:
+            await registry.send(
+                result.device_id,
+                {"type": "command_result", **body},
+            )
+        return JSONResponse(status_code=code, content=body)
+
+    @app.get("/metrics/commands")
+    async def command_metrics() -> JSONResponse:
+        metrics = await asyncio.to_thread(gateway.command_metrics)
+        return JSONResponse(status_code=200, content=metrics.to_dict())
 
     @app.websocket("/ws/{device_id}")
     async def device_ws(ws: WebSocket, device_id: str) -> None:

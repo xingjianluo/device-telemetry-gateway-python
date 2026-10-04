@@ -7,6 +7,7 @@ HTTP 授权/越权指令，以及指令结果向在线设备的同步推送。
 from __future__ import annotations
 
 import json
+import threading
 import time
 import unittest
 
@@ -29,6 +30,26 @@ def build_client() -> TestClient:
     )
     gw = Gateway(executor=executor, known_devices=frozenset({"d1", "d2"}))
     return TestClient(create_app(gw))
+
+
+def build_cancel_client() -> tuple[TestClient, threading.Event, threading.Event]:
+    """带确定性闸门的客户端：slow(n=0) 进入执行即置 ready，并阻塞在 gate。"""
+    gate = threading.Event()
+    ready = threading.Event()
+
+    def slow(device_id: str, args: dict) -> dict:
+        if args.get("n") == 0:
+            ready.set()
+            gate.wait(timeout=3)
+        return {"n": args["n"]}
+
+    executor = CommandExecutor(
+        authorizations={"d1": frozenset({"slow"})},
+        handlers={"slow": slow},
+        max_queue=8, max_history=4, max_retired=8,
+    )
+    gw = Gateway(executor=executor, known_devices=frozenset({"d1"}))
+    return TestClient(create_app(gw)), gate, ready
 
 
 class TransportTests(unittest.TestCase):
@@ -105,6 +126,71 @@ class TransportTests(unittest.TestCase):
         print("判定依据: 授权表校验；结果推送在线设备；同 command_id 复用结果")
         print(f"最终状态: ok={ok['status']}, pushed={pushed['type']}, "
               f"denied=403 COMMAND_UNAUTHORIZED, duplicate={again['duplicate']}")
+
+    def test_http_query_cancel_and_metrics(self) -> None:
+        client, gate, ready = build_cancel_client()
+        # 从未提交的指令号查询 -> 404 COMMAND_NOT_FOUND
+        missing = client.get("/commands/ghost")
+        self.assertEqual(missing.status_code, 404)
+        self.assertEqual(missing.json()["error"]["reason"], "COMMAND_NOT_FOUND")
+
+        # 票据 0 在途（阻塞），票据 1 排队
+        starter = threading.Thread(target=lambda: client.post(
+            "/commands",
+            json={"device_id": "d1", "command_id": "q-0", "name": "slow",
+                  "args": {"n": 0}}))
+        starter.start()
+        self.assertTrue(ready.wait(3))
+        queued = threading.Thread(target=lambda: client.post(
+            "/commands",
+            json={"device_id": "d1", "command_id": "q-1", "name": "slow",
+                  "args": {"n": 1}}))
+        queued.start()
+        # 确定性等待排队记录出现（time 仅作失败兜底，不参与判定）
+        deadline = time.monotonic() + 3
+        while client.get("/commands/q-1").json().get("state") != "queued" \
+                and time.monotonic() < deadline:
+            pass
+
+        q1 = client.get("/commands/q-1").json()
+        self.assertEqual(q1["state"], "queued")
+
+        # 取消排队中 -> 200 cancelled；重复取消幂等
+        cancelled = client.post("/commands/q-1/cancel")
+        self.assertEqual(cancelled.status_code, 200)
+        self.assertEqual(cancelled.json()["status"], "cancelled")
+        cancel_again = client.post("/commands/q-1/cancel").json()
+        self.assertTrue(cancel_again["duplicate"])
+
+        # 取消执行中 -> 409 COMMAND_NOT_CANCELLABLE
+        running = client.post("/commands/q-0/cancel")
+        self.assertEqual(running.status_code, 409)
+        self.assertEqual(running.json()["error"]["reason"],
+                         "COMMAND_NOT_CANCELLABLE")
+        # 取消不存在 -> 404 COMMAND_NOT_FOUND
+        self.assertEqual(client.post("/commands/zzz/cancel").status_code, 404)
+
+        gate.set()
+        starter.join()
+        queued.join()
+
+        # 放行后：q-0 成功；q-1 维持 cancelled；反复查询结论一致
+        self.assertEqual(client.get("/commands/q-0").json()["state"], "succeeded")
+        self.assertEqual(client.get("/commands/q-1").json()["state"], "cancelled")
+        self.assertEqual(client.get("/commands/q-1").json()["state"], "cancelled")
+
+        metrics = client.get("/metrics/commands").json()
+        self.assertTrue(metrics["accounts_balanced"])
+        self.assertEqual(
+            metrics["submitted"],
+            metrics["accepted"] + metrics["duplicates"]
+            + sum(metrics["rejected"].values()))
+
+        print("\n用例: HTTP 指令查询/取消/对账")
+        print("输入: 查 ghost / q-0 在途 / q-1 排队; 取消 q-1,q-0,zzz; 放行")
+        print("判定依据: NOT_FOUND=404; QUEUED 可取消且幂等; RUNNING 409; 账平")
+        print(f"最终状态: missing=404, q-1={cancelled.json()['status']}, "
+              f"running=409, metrics={metrics}")
 
 
 if __name__ == "__main__":
