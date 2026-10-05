@@ -96,6 +96,9 @@ class CommandExecutor:
       * 每个设备一把串行队列 + 一个工作线程 => 同设备指令严格按提交顺序生效；
       * command_id 全局幂等 => 并发提交相同 command_id 只执行一次，无状态回退；
       * 队列长度有界 => 积压超限返回 COMMAND_QUEUE_FULL，不做无界堆积；
+      * 提交即拒（设备未知/未授权/积压超限）的指令同样落 REJECTED 终态记录：
+        凭 command_id 可查到明确、可区分的“已拒绝”结论，与“从未提交”的
+        COMMAND_NOT_FOUND 截然不同，且与成功/失败/取消一样受终态容量治理；
       * 指令状态进入 BoundedCommandStore：可凭 command_id 查询、可取消尚未
         开始执行者、终态按 FIFO 有界保留并以墓碑防止二次执行。
     """
@@ -116,6 +119,76 @@ class CommandExecutor:
         self._store = BoundedCommandStore(
             max_history=max_history, max_retired=max_retired
         )
+
+    # ------------------------------------------------------------------
+    def _submission_rejection_locked(
+        self, command: Command, reason: ParseError
+    ) -> CommandResult:
+        """“提交即拒”的统一落账（必须在 self._lock 内调用）。
+
+        * 该 command_id 已有结论（记录或墓碑）-> 绝不覆盖他人记录、绝不
+          重复执行：同设备复用既有结论（duplicate 幂等）；跨设备
+          COMMAND_DUPLICATE；已淘汰墓碑 COMMAND_RETIRED —— 同一指令号
+          无论查多少次、再提交多少次，结论稳定一致；
+        * 否则登记一条新的 REJECTED 终态记录（可凭号查询、受终态容量
+          治理），并计入对应拒绝原因，对账口径不变。
+        """
+        command_id = command.command_id
+        device_id = command.device_id
+        tomb = self._store.retired_snapshot(command_id)
+        if tomb is not None:
+            self._store.count_rejection(R_COMMAND_RETIRED)
+            logger.info(
+                "command reject command_id=%s input=device=%s name=%s reason=%s "
+                "prior_state=%s",
+                command_id, device_id, command.name, R_COMMAND_RETIRED,
+                tomb.state.value,
+            )
+            return _reject(
+                command_id,
+                ParseError(
+                    R_COMMAND_RETIRED,
+                    f"command_id {command_id!r} already concluded "
+                    f"({tomb.state.value}) and retired from the retention "
+                    "window",
+                ),
+                device_id=tomb.device_id,
+            )
+        existing = self._store.get(command_id)
+        if existing is not None:
+            if existing.device_id != device_id:
+                self._store.count_rejection(R_COMMAND_DUPLICATE)
+                logger.info(
+                    "command reject command_id=%s input=device=%s name=%s "
+                    "reason=%s owner=%s",
+                    command_id, device_id, command.name,
+                    R_COMMAND_DUPLICATE, existing.device_id,
+                )
+                return _reject(
+                    command_id,
+                    ParseError(
+                        R_COMMAND_DUPLICATE,
+                        "command_id already used by another device",
+                    ),
+                    device_id=existing.device_id,
+                )
+            # 同设备同号：复用既有结论（典型即此前的 REJECTED 记录），幂等
+            self._store.count_duplicate()
+            logger.info(
+                "command duplicate-of-rejection command_id=%s input=device=%s "
+                "name=%s prior_state=%s",
+                command_id, device_id, command.name, existing.state.value,
+            )
+            return _status_to_result(
+                self._store.snapshot_record(existing), duplicate=True
+            )
+        self._store.count_rejection(reason.reason)
+        self._store.create_rejected(command_id, device_id, command.name, reason)
+        logger.info(
+            "command reject command_id=%s input=device=%s name=%s reason=%s",
+            command_id, device_id, command.name, reason.reason,
+        )
+        return _reject(command_id, reason, device_id=device_id)
 
     # ------------------------------------------------------------------
     def _get_or_create_device_locked(self, device_id: str) -> _DeviceState:
@@ -219,33 +292,29 @@ class CommandExecutor:
         """提交并阻塞至该指令被串行执行完毕（或被取消）。
 
         每个提交在锁内被归类为 accepted / duplicate / rejected 之一，对账恒平。
+        提交即拒（设备未知/未授权/积压超限）也会落 REJECTED 终态记录，
+        事后凭 command_id 可查到与“从未提交”明确可区分的结论。
         """
         device_id = command.device_id
         command_id = command.command_id
 
-        # 预校验（设备/授权）：不建立任何指令记录，仅计入提交与拒绝
+        # 预校验（设备/授权）：被拒指令也登记 REJECTED 终态记录，使事后可凭
+        # command_id 查到明确、可区分的“已拒绝”结论（与“从未提交”截然不同）；
+        # 对账上仍只计入 submitted 与对应 rejected 原因，口径不变。
         with self._lock:
             self._store.count_submission()
             allowed = self._auth.get(device_id)
             if allowed is None:
-                self._store.count_rejection(R_DEVICE_UNKNOWN)
-                logger.info(
-                    "command reject command_id=%s input=device=%s name=%s reason=%s",
-                    command_id, device_id, command.name, R_DEVICE_UNKNOWN,
-                )
-                return _reject(
-                    command_id,
-                    ParseError(R_DEVICE_UNKNOWN,
-                               f"device {device_id!r} is not registered"),
+                return self._submission_rejection_locked(
+                    command,
+                    ParseError(
+                        R_DEVICE_UNKNOWN,
+                        f"device {device_id!r} is not registered",
+                    ),
                 )
             if command.name not in allowed:
-                self._store.count_rejection(R_COMMAND_UNAUTHORIZED)
-                logger.info(
-                    "command reject command_id=%s input=device=%s name=%s reason=%s",
-                    command_id, device_id, command.name, R_COMMAND_UNAUTHORIZED,
-                )
-                return _reject(
-                    command_id,
+                return self._submission_rejection_locked(
+                    command,
                     ParseError(
                         R_COMMAND_UNAUTHORIZED,
                         f"device {device_id!r} is not authorized for "
@@ -296,6 +365,19 @@ class CommandExecutor:
                         ),
                         device_id=record.device_id,
                     )
+                if record.state is CommandState.REJECTED:
+                    # 该 id 此前提交即被拒：复用同一拒绝结论（幂等），
+                    # 绝不因队列已有空位/授权变更而改判或补执行
+                    self._store.count_duplicate()
+                    logger.info(
+                        "command duplicate-of-rejection command_id=%s "
+                        "input=device=%s name=%s reason=%s",
+                        command_id, device_id, command.name,
+                        record.reason.reason if record.reason else "-",
+                    )
+                    return _status_to_result(
+                        self._store.snapshot_record(record), duplicate=True
+                    )
                 # 并发/重复提交：等待首个提交的结论，本调用不重复执行
                 self._store.count_duplicate()
                 event = record.event
@@ -307,21 +389,15 @@ class CommandExecutor:
                     # 即有效积压口径“在途 + 排队 <= max_queue + 1”，超限即拒绝。
                     state.queue.put_nowait(command)
                 except Full:
-                    self._store.count_rejection(R_COMMAND_QUEUE_FULL)
-                    logger.info(
-                        "command reject command_id=%s input=device=%s name=%s "
-                        "reason=%s limit=%d",
-                        command_id, device_id, command.name,
-                        R_COMMAND_QUEUE_FULL, self._max_queue,
-                    )
-                    return _reject(
-                        command_id,
+                    # 积压超限被拒同样登记 REJECTED 终态：事后凭号可查、
+                    # 与从未提交可区分；受同一套终态容量治理，不无界增长
+                    return self._submission_rejection_locked(
+                        command,
                         ParseError(
                             R_COMMAND_QUEUE_FULL,
                             f"backlog limit {self._max_queue} reached for "
                             f"{device_id!r}",
                         ),
-                        device_id=device_id,
                     )
                 # 入队成功才建立状态（QUEUED）并计入 accepted
                 record = self._store.create_queued(command_id, device_id, command.name)
@@ -342,7 +418,11 @@ class CommandExecutor:
     # ------------------------------------------------------------------
     # ---- 指令状态查询 / 取消 / 对账 ----
     def query_status(self, command_id: str) -> CommandStatus | ParseError:
-        """凭指令号查询：同一 id 反复查询结论稳定一致；未提交过 -> NOT_FOUND。"""
+        """凭指令号查询：同一 id 反复查询结论稳定一致；未提交过 -> NOT_FOUND。
+
+        提交即拒的指令返回 REJECTED 终态快照（含具体拒绝原因），与
+        COMMAND_NOT_FOUND（从未提交/已被彻底遗忘）明确可区分。
+        """
         with self._lock:
             status = self._store.status(command_id)
         if status is None:

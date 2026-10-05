@@ -191,6 +191,46 @@ class TransportTests(unittest.TestCase):
         print("判定依据: NOT_FOUND=404; QUEUED 可取消且幂等; RUNNING 409; 账平")
         print(f"最终状态: missing=404, q-1={cancelled.json()['status']}, "
               f"running=409, metrics={metrics}")
+    def test_http_rejected_command_is_queryable(self) -> None:
+        client = build_client()
+        # 越权指令提交即拒（403），但事后凭指令号可查明确“已拒绝”结论
+        denied = client.post("/commands", json={
+            "device_id": "d2", "command_id": "http-rej", "name": "reboot"})
+        self.assertEqual(denied.status_code, 403)
+        self.assertEqual(denied.json()["error"]["reason"], "COMMAND_UNAUTHORIZED")
+
+        q1 = client.get("/commands/http-rej")
+        self.assertEqual(q1.status_code, 200)
+        self.assertEqual(q1.json()["state"], "rejected")
+        self.assertEqual(q1.json()["error"]["reason"], "COMMAND_UNAUTHORIZED")
+        self.assertEqual(q1.json()["device_id"], "d2")
+        # 反复查询结论稳定一致
+        q2 = client.get("/commands/http-rej").json()
+        self.assertEqual(q1.json(), q2)
+        # 与“从未提交”明确可区分：后者 404 COMMAND_NOT_FOUND
+        missing = client.get("/commands/http-nope")
+        self.assertEqual(missing.status_code, 404)
+        self.assertEqual(missing.json()["error"]["reason"], "COMMAND_NOT_FOUND")
+        # 同号再提交：仍是同一拒绝结论（幂等 duplicate），不会变成执行
+        again = client.post("/commands", json={
+            "device_id": "d2", "command_id": "http-rej", "name": "reboot"})
+        self.assertEqual(again.status_code, 403)
+        self.assertEqual(again.json()["status"], "rejected")
+        self.assertEqual(again.json()["error"]["reason"], "COMMAND_UNAUTHORIZED")
+        self.assertTrue(again.json()["duplicate"])
+
+        metrics = client.get("/metrics/commands").json()
+        self.assertTrue(metrics["accounts_balanced"])
+        self.assertEqual(metrics["rejected"].get("COMMAND_UNAUTHORIZED"), 1)
+        self.assertEqual(metrics["duplicates"], 1)
+
+        print("\n用例: HTTP 被拒指令凭号可查")
+        print("输入: d2 reboot(越权) -> 查 http-rej 两次 -> 查 http-nope -> 同号再提交")
+        print("判定依据: 被拒=200 state=rejected+原因; 从未提交=404; "
+              "同号再提交幂等复用拒绝结论; 账平")
+        print(f"最终状态: query={q1.json()['state']}/{q1.json()['error']['reason']}, "
+              f"missing=404, resubmit_duplicate={again.json()['duplicate']}, "
+              f"metrics={metrics}")
 
 
 if __name__ == "__main__":

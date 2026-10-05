@@ -227,7 +227,7 @@ curl http://127.0.0.1:8000/metrics/commands
 | `COMMAND_HANDLER_ERROR` | 处理器抛异常（不影响串行循环） |
 | `COMMAND_QUEUE_FULL` | 设备积压超过有界上限 |
 | `COMMAND_DUPLICATE` | command_id 已被其它设备使用 |
-| `COMMAND_NOT_FOUND` | 指令号从未提交（或已超出墓碑保留窗被彻底遗忘） |
+| `COMMAND_NOT_FOUND` | 指令号从未提交（或已超出墓碑保留窗被彻底遗忘）；提交即拒的指令有 `rejected` 终态可查，不在此列 |
 | `COMMAND_NOT_CANCELLABLE` | 指令已开始执行或已到终态，不可取消 |
 | `COMMAND_RETIRED` | command_id 已完成并按容量规则淘汰，窗内重用拒绝（防二次执行） |
 
@@ -292,12 +292,38 @@ curl http://127.0.0.1:8000/metrics/commands
 ### 4.5 查询与取消（本轮新增）
 
 - **查询**：`GET /commands/{id}` 对任意指令号给出明确、可区分、可重复的
-  结论：执行中状态 / 成功 / 失败 / 已取消 / 已淘汰（`retired`）/ 不存在
-  （`COMMAND_NOT_FOUND`）。
+  结论：执行中状态 / 成功 / 失败 / 已取消 / **已拒绝（rejected）** /
+  已淘汰（`retired`）/ 不存在（`COMMAND_NOT_FOUND`）。
 - **取消**：仅 `queued` 可取消；重复取消幂等；`running` 与终态明确拒绝；
   取消不摘队列位置，保证同设备其它指令顺序不变，且不会“既取消又执行”。
 - 两个新能力都建立在上一轮的每设备串行队列与全局 `command_id` 幂等之上，
   不改变上一轮的鉴权、保序、去重、续传行为（见第 8 节兼容关系）。
+
+### 4.6 提交即拒指令的查询语义（本轮新增）
+
+在提交那一刻就被拒的指令（设备未注册 `DEVICE_UNKNOWN`、越权
+`COMMAND_UNAUTHORIZED`、积压超限 `COMMAND_QUEUE_FULL`）**同样落一条
+`rejected` 终态记录**，事后凭 `command_id` 可查到明确结论：
+
+- **可查、可区分**：`GET /commands/{id}` 返回 `200` +
+  `{"state": "rejected", "error": {"reason": ...}}`，`reason` 精确区分
+  是被授权挡下、设备不存在还是积压超限；而**从未提交过**的指令号返回
+  `404 COMMAND_NOT_FOUND` —— 两者是截然不同的答复，运维不会混淆。
+- **结论稳定**：同一被拒指令号反复查询返回同一不可变快照；同号再次提交
+  幂等复用原拒绝结论（`duplicate=true`），即使积压已排空、条件已变化，
+  也**绝不改判、绝不补执行**；该指令永远不会被计入 `accepted` /
+  `succeeded`。
+- **容量有界**：`rejected` 记录与成功/失败/取消一样进入 `max_history`
+  FIFO 保留窗，淘汰后进入 `max_retired` 墓碑环（查询得到
+  `retired=true` 的淘汰前结论，窗内同号再提交 `COMMAND_RETIRED`），
+  墓碑超窗后被彻底遗忘（回到 `COMMAND_NOT_FOUND`）—— 被拒状态不会
+  无界增长。
+- **对账口径不变**：被拒指令仍只在提交时归类一次，
+  `submitted = accepted + duplicates + Σrejected` 恒成立；`rejected`
+  终态计数在 `metrics.terminal.rejected` 中单调累计、不随淘汰回退。
+- 注意：`COMMAND_DUPLICATE`（跨设备复用）与 `COMMAND_RETIRED`（窗内重放）
+  两类拒绝不落新记录 —— 该 `command_id` 已有归属记录/墓碑，查询它得到的
+  是**原主**的结论，同样可区分、不混淆。
 
 ---
 
@@ -312,6 +338,9 @@ curl http://127.0.0.1:8000/metrics/commands
 | 越权下发 | 入队前按授权表拒绝，原因独立 |
 | 并发下发 | 每设备串行保序 + command_id 幂等 + 有界积压拒绝 |
 | 事后查不到结论 | 状态机 + 不可变快照：终态/在途/已淘汰/不存在各自可区分、重复查询一致 |
+| 被拒与从未提交混淆 | 提交即拒落 `rejected` 终态记录（含具体原因）；从未提交才是 `COMMAND_NOT_FOUND` |
+| 被拒指令被补执行/改判 | 同号再提交幂等复用原拒绝结论；`rejected` 为终态，绝不入队、不计成功 |
+| 被拒状态无界累积 | `rejected` 记录纳入同一 FIFO 保留窗 + 墓碑环，超窗彻底遗忘 |
 | 误取消在执行指令 | 仅 queued 可取消；running/终态 COMMAND_NOT_CANCELLABLE |
 | 取消打乱顺序 | 取消只标记不摘队列，轮到时占位跳过，其它指令相对顺序不变 |
 | 既取消又执行/状态回退 | 状态只进不退；worker 跳过已取消指令；终态不可退回 |
@@ -325,14 +354,16 @@ curl http://127.0.0.1:8000/metrics/commands
 ## 6. 本地验证
 
 ```bash
-# 全部单测（31 个：核心 13 + 指令生命周期 15 + 传输层 3）
+# 全部单测（38 个：核心 13 + 指令生命周期 21 + 传输层 4）
 uv run python -m unittest discover -s tests -v
 
 # 仅核心网关（分片/去重/续传/版本/鉴权/并发）
 uv run python -m unittest tests.test_gateway -v
-# 仅本轮新增：指令查询 / 取消 / 容量 / 对账
+# 仅指令生命周期：查询 / 取消 / 容量 / 对账 / 被拒可查
 uv run python -m unittest tests.test_commands_lifecycle -v
-# 仅传输层（WebSocket + HTTP，含查询/取消/对账端点）
+# 仅被拒指令查询语义（提交即拒可查、稳定、有界、账平）
+uv run python -m unittest tests.test_commands_lifecycle.RejectedQueryTests -v
+# 仅传输层（WebSocket + HTTP，含查询/取消/对账/被拒可查端点）
 uv run python -m unittest tests.test_transport -v
 
 # 编译检查
@@ -367,6 +398,13 @@ curl -X POST http://127.0.0.1:8000/commands \
   -d '{"device_id":"device-001","command_id":"c-1","name":"reboot"}'
 curl http://127.0.0.1:8000/commands/c-1
 curl http://127.0.0.1:8000/metrics/commands
+# 4) 提交即拒也可查：device-002 未授权 reboot -> 403；
+#    凭号查询得到 200 state=rejected + COMMAND_UNAUTHORIZED（与 404 截然不同）；
+#    同号再提交仍复用原拒绝结论（duplicate=true）
+curl -i -X POST http://127.0.0.1:8000/commands \
+  -H 'Content-Type: application/json' \
+  -d '{"device_id":"device-002","command_id":"c-denied","name":"reboot"}'
+curl http://127.0.0.1:8000/commands/c-denied
 ```
 
 遥测分片的手工联调示例（需 `websockets` 客户端）：
@@ -402,11 +440,11 @@ gateway/
   telemetry.py     # 版本兼容、必填/未知必填校验、缺省归一化
   session.py       # 会话与已确认序列号（续传游标）
   commandstore.py  # 指令状态机：查询快照、取消判定、FIFO 保留 + 墓碑环、对账计数
-  commands.py      # 鉴权、每设备串行队列、幂等去重、有界积压、查询/取消入口
+  commands.py      # 鉴权、每设备串行队列、幂等去重、有界积压、提交即拒落账、查询/取消入口
   gateway.py       # 门面：去重落库 + 续传 + 指令下发/查询/取消/对账
   app.py           # FastAPI：WebSocket / HTTP（含查询、取消、对账端点）
 main.py            # 默认授权表与处理器装配；容量参数走环境变量
-tests/             # 31 个单测（核心 13 + 指令生命周期 15 + 传输层 3）
+tests/             # 38 个单测（核心 13 + 指令生命周期 21 + 传输层 4）
 ```
 
 ---
@@ -419,10 +457,14 @@ tests/             # 31 个单测（核心 13 + 指令生命周期 15 + 传输�
    `status`、`duplicate`、`response`、`error`）保持原样；`CommandResult`
    新增的 `device_id` 字段有默认值，旧调用方无需改动。成功仍为 `status="ok"`，
    鉴权/积压/跨设备重复等拒绝原因码与 HTTP 403 语义不变。
-2. **状态机是叠加视图**：指令五态（`queued/running/succeeded/failed/cancelled`）
+2. **状态机是叠加视图**：指令六态
+   （`queued/running/succeeded/failed/cancelled/rejected`）
    是对既有“提交并阻塞至执行完毕”结果的细化——`succeeded` 对应旧的 `ok`，
    `failed` 对应处理器层面的 `rejected`（`COMMAND_UNSUPPORTED` /
-   `COMMAND_HANDLER_ERROR`），`cancelled` 为新增。
+   `COMMAND_HANDLER_ERROR`），`cancelled` 为新增；`rejected` 对应
+   “提交即拒”（`DEVICE_UNKNOWN` / `COMMAND_UNAUTHORIZED` /
+   `COMMAND_QUEUE_FULL`），提交响应的状态码与原因码保持不变，只是事后
+   多了可查询的终态记录。
 3. **串行保序与幂等不放松**：取消只标记、不摘队列，因此同设备 FIFO 顺序、
    全局 `command_id` 幂等、跨设备复用拒绝等保证与上一轮完全一致；新增的
    “墓碑窗内重用拒绝（`COMMAND_RETIRED`）”只在指令已离开活跃/保留窗后才

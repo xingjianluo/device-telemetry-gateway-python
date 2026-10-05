@@ -25,7 +25,8 @@ class CommandState(str, Enum):
 
     QUEUED -> RUNNING -> SUCCEEDED | FAILED
     QUEUED -> CANCELLED            （仅“尚未开始执行”可取消）
-    后三者为终态，状态只进不退。
+    （提交即拒）  -> REJECTED       （授权/设备/积压预检未通过，从未入队执行）
+    后四者为终态，状态只进不退。
     """
 
     QUEUED = "queued"
@@ -33,10 +34,16 @@ class CommandState(str, Enum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    REJECTED = "rejected"
 
 
 TERMINAL_STATES = frozenset(
-    {CommandState.SUCCEEDED, CommandState.FAILED, CommandState.CANCELLED}
+    {
+        CommandState.SUCCEEDED,
+        CommandState.FAILED,
+        CommandState.CANCELLED,
+        CommandState.REJECTED,
+    }
 )
 
 
@@ -162,6 +169,36 @@ class BoundedCommandStore:
             "command accepted command_id=%s device=%s name=%s state=%s",
             command_id, device_id, name, CommandState.QUEUED.value,
         )
+        return record
+
+    def create_rejected(
+        self, command_id: str, device_id: str, name: str, reason: ParseError
+    ) -> CommandRecord:
+        """登记一条“提交即拒”的 REJECTED 终态记录（从未入队、绝不执行）。
+
+        目的：让被拒指令凭 command_id 可查到明确、可区分、稳定一致的“已拒绝”
+        结论，而不是与“从未提交”混为 NOT_FOUND。记录直接以终态进入 FIFO
+        保留窗，与成功/失败/取消一样受 max_history/max_retired 容量治理，
+        因此这类状态不会无界增长。对账上它计入 rejected[reason]（由调用方
+        计数），绝不计入 accepted，也绝不会被当成执行过/执行成功。
+        """
+        record = CommandRecord(
+            command_id=command_id,
+            device_id=device_id,
+            name=name,
+            state=CommandState.REJECTED,
+            reason=reason,
+        )
+        self._records[command_id] = record
+        self._terminal[CommandState.REJECTED.value] += 1
+        self._finish_order.append(command_id)
+        logger.info(
+            "command terminal command_id=%s device=%s state=%s reason=%s "
+            "(rejected at submission; never queued)",
+            command_id, device_id, CommandState.REJECTED.value, reason.reason,
+        )
+        self._evict_if_needed()
+        record.event.set()  # 防御性：终态记录不应再有人等待
         return record
 
     def retired_snapshot(self, command_id: str) -> CommandStatus | None:

@@ -22,6 +22,8 @@ from gateway.protocol import (
     R_COMMAND_NOT_FOUND,
     R_COMMAND_QUEUE_FULL,
     R_COMMAND_RETIRED,
+    R_COMMAND_UNAUTHORIZED,
+    R_DEVICE_UNKNOWN,
 )
 
 
@@ -139,6 +141,219 @@ class QueryStatusTests(unittest.TestCase):
                "1 次真正执行 + 5 个 duplicate 复用同一结论；执行次数恰为 1",
                {"executed": rig.executed, "state": q.state.value,
                 "duplicates": len(dups)})
+
+
+class RejectedQueryTests(unittest.TestCase):
+    """提交即拒（未授权/设备不存在/积压超限）的指令：凭号可查、结论稳定、
+    与“从未提交”明确可区分、容量有界、对账口径不变。"""
+
+    def test_unauthorized_rejection_is_queryable_and_stable(self) -> None:
+        rig = BlockingRig(authz={"d1": frozenset({"blocking", "boom"}),
+                                 "d2": frozenset()})
+        r = rig.gateway.submit_command(Command("d2", "rej-1", "blocking"))
+        self.assertEqual(r.status, "rejected")
+        self.assertEqual(r.reason.reason, R_COMMAND_UNAUTHORIZED)
+        # 同一被拒指令号连续查多次：结论逐字节一致
+        queries = [rig.gateway.query_command("rej-1") for _ in range(3)]
+        for q in queries:
+            self.assertEqual(q.state, CommandState.REJECTED)
+            self.assertEqual(q.reason.reason, R_COMMAND_UNAUTHORIZED)
+            self.assertEqual(q.device_id, "d2")
+            self.assertFalse(q.retired)
+        self.assertEqual(
+            [(q.state, q.reason, q.device_id) for q in queries],
+            [(queries[0].state, queries[0].reason, queries[0].device_id)] * 3,
+            "被拒指令号反复查询结论必须稳定一致")
+        # “被拒”与“从未提交”是两种明确、可区分的答复
+        missing = rig.gateway.query_command("rej-ghost")
+        self.assertEqual(missing.reason, R_COMMAND_NOT_FOUND)
+        self.assertNotEqual(queries[0].state.value, missing.reason)
+        # 被拒指令从未入队、从未执行
+        self.assertEqual(rig.executed, [])
+        report("被拒可查-未授权拒绝稳定可区分",
+               {"submit": "d2/blocking(未授权)", "query": ["rej-1"] * 3,
+                "also_query": "rej-ghost"},
+               "提交即拒 -> rejected 终态落账；反复查询同一快照；"
+               "从未提交 -> COMMAND_NOT_FOUND，两种答复截然不同",
+               {"state": queries[0].state.value,
+                "reason": queries[0].reason.reason,
+                "missing": missing.reason, "executed": rig.executed})
+
+    def test_unknown_device_rejection_has_distinct_reason(self) -> None:
+        rig = BlockingRig()
+        r = rig.gateway.submit_command(Command("ghost", "rej-2", "blocking"))
+        self.assertEqual(r.status, "rejected")
+        self.assertEqual(r.reason.reason, R_DEVICE_UNKNOWN)
+        q = rig.gateway.query_command("rej-2")
+        self.assertEqual(q.state, CommandState.REJECTED)
+        self.assertEqual(q.reason.reason, R_DEVICE_UNKNOWN)
+        self.assertEqual(q.device_id, "ghost")
+        # 三类拒绝原因互可区分：设备不存在 != 未授权 != 积压超限
+        self.assertNotEqual(q.reason.reason, R_COMMAND_UNAUTHORIZED)
+        self.assertNotEqual(q.reason.reason, R_COMMAND_QUEUE_FULL)
+        report("被拒可查-设备不存在原因可区分",
+               {"submit": "ghost/blocking(设备未注册)", "query": "rej-2"},
+               "设备未注册 -> rejected + DEVICE_UNKNOWN；"
+               "与 COMMAND_UNAUTHORIZED / COMMAND_QUEUE_FULL 明确区分",
+               {"state": q.state.value, "reason": q.reason.reason})
+    def test_queue_full_rejection_queryable_and_not_replayed_after_drain(self) -> None:
+        # 确定性铺满：票据 0 在途 + 排队 3 槽；第 5 个提交被积压上限拒绝
+        rig = BlockingRig(max_queue=3)
+        starter = threading.Thread(
+            target=rig.gateway.submit_command,
+            args=(Command("d1", "b-0", "blocking", {"n": 0}),))
+        starter.start()
+        self.assertTrue(rig.ready.wait(3))  # b-0 确定 RUNNING
+        waiters = [
+            threading.Thread(
+                target=rig.gateway.submit_command,
+                args=(Command("d1", f"b-{n}", "blocking", {"n": n}),))
+            for n in (1, 2, 3)]
+        for th in waiters:
+            th.start()
+        import time as _time
+        state = rig.executor._devices["d1"]
+        deadline = _time.monotonic() + 3
+        while state.queue.qsize() < 3 and _time.monotonic() < deadline:
+            pass
+        self.assertEqual(state.queue.qsize(), 3, "排队槽必须确定性铺满")
+        r = rig.gateway.submit_command(Command("d1", "b-4", "blocking", {"n": 4}))
+        self.assertEqual(r.status, "rejected")
+        self.assertEqual(r.reason.reason, R_COMMAND_QUEUE_FULL)
+        # 被拒当下即可凭号查到明确结论
+        q1 = rig.gateway.query_command("b-4")
+        self.assertEqual(q1.state, CommandState.REJECTED)
+        self.assertEqual(q1.reason.reason, R_COMMAND_QUEUE_FULL)
+        # 放行排空：积压有了空位，但同号再提交绝不改判、绝不补执行
+        rig.open()
+        starter.join()
+        for th in waiters:
+            th.join()
+        again = rig.gateway.submit_command(
+            Command("d1", "b-4", "blocking", {"n": 4}))
+        self.assertEqual(again.status, "rejected")
+        self.assertEqual(again.reason.reason, R_COMMAND_QUEUE_FULL)
+        self.assertTrue(again.duplicate, "同号再提交必须幂等复用原拒绝结论")
+        self.assertNotIn("d1:4", rig.executed, "被拒指令绝不能被补执行")
+        q2 = rig.gateway.query_command("b-4")
+        self.assertEqual(q2.state, CommandState.REJECTED)
+        self.assertEqual(q2.reason.reason, R_COMMAND_QUEUE_FULL)
+        m = rig.gateway.command_metrics()
+        self.assertTrue(m.accounts_balanced())
+        self.assertEqual(m.terminal.get("succeeded"), 4,
+                         "只有真正入队的 4 条成功，被拒的不计入成功")
+        report("被拒可查-积压超限且排空后不重放",
+               {"max_queue": 3, "overflow_submit": "b-4",
+                "after_drain_resubmit": "b-4"},
+               "QUEUE_FULL 拒绝落账可查；排空后同号再提交仍复用原拒绝结论"
+               "(duplicate)，绝不补执行；成功计数不含被拒指令",
+               {"q1": q1.reason.reason, "resubmit": again.reason.reason,
+                "duplicate": again.duplicate, "executed": rig.executed,
+                "succeeded": m.terminal.get("succeeded")})
+
+    def test_concurrent_rejected_submissions_converge_to_single_verdict(self) -> None:
+        rig = BlockingRig(authz={"d1": frozenset({"blocking", "boom"}),
+                                 "d2": frozenset()})
+        barrier = threading.Barrier(6)
+        out: list = []
+        lock = threading.Lock()
+
+        def fire() -> None:
+            barrier.wait()
+            r = rig.gateway.submit_command(Command("d2", "rej-c", "blocking"))
+            with lock:
+                out.append(r)
+
+        threads = [threading.Thread(target=fire) for _ in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        # 全部得到同一个“已拒绝”结论：恰好 1 次记拒绝，其余幂等 duplicate
+        self.assertTrue(all(r.status == "rejected" for r in out))
+        self.assertTrue(
+            all(r.reason.reason == R_COMMAND_UNAUTHORIZED for r in out))
+        self.assertEqual(len([r for r in out if not r.duplicate]), 1)
+        self.assertEqual(len([r for r in out if r.duplicate]), 5)
+        q = rig.gateway.query_command("rej-c")
+        self.assertEqual(q.state, CommandState.REJECTED)
+        self.assertEqual(q.reason.reason, R_COMMAND_UNAUTHORIZED)
+        m = rig.gateway.command_metrics()
+        self.assertEqual(m.rejected.get(R_COMMAND_UNAUTHORIZED), 1)
+        self.assertEqual(m.duplicates, 5)
+        self.assertEqual(m.terminal.get("rejected"), 1,
+                         "同一指令号只落一条 REJECTED 记录")
+        self.assertTrue(m.accounts_balanced())
+        self.assertEqual(rig.executed, [])
+        report("被拒可查-并发同号收敛单一结论",
+               {"concurrency": 6, "command_id": "rej-c", "device": "d2(未授权)"},
+               "6 路并发同号提交全被拒：1 次落账 + 5 次 duplicate；"
+               "查询/计数/对账结论唯一",
+               {"duplicates": m.duplicates,
+                "rejected": m.rejected, "state": q.state.value})
+    def test_rejected_records_are_bounded_by_history_and_tombstones(self) -> None:
+        rig = BlockingRig(max_history=2, max_retired=2,
+                          authz={"d1": frozenset({"blocking"}),
+                                 "d2": frozenset()})
+        for n in range(5):
+            r = rig.gateway.submit_command(Command("d2", f"rj-{n}", "blocking"))
+            self.assertEqual(r.status, "rejected")
+        m = rig.gateway.command_metrics()
+        # 被拒记录与成功/失败/取消一样纳入终态容量治理：保留窗与墓碑环都有界
+        self.assertEqual(m.history, 2)
+        self.assertEqual(m.retired, 2)
+        self.assertEqual(m.terminal.get("rejected"), 5,
+                         "终态计数单调累计，不随淘汰回退")
+        # 最老的被拒记录被彻底遗忘 -> 回到“从未提交”的答复
+        forgotten = rig.gateway.query_command("rj-0")
+        self.assertEqual(forgotten.reason, R_COMMAND_NOT_FOUND)
+        # 墓碑窗内：仍给出淘汰前的“已拒绝”结论，原因保留、可区分
+        tomb = rig.gateway.query_command("rj-2")
+        self.assertTrue(tomb.retired)
+        self.assertEqual(tomb.state, CommandState.REJECTED)
+        self.assertEqual(tomb.reason.reason, R_COMMAND_UNAUTHORIZED)
+        # 保留窗内：retired=False 的鲜活终态
+        fresh = rig.gateway.query_command("rj-4")
+        self.assertFalse(fresh.retired)
+        self.assertEqual(fresh.state, CommandState.REJECTED)
+        # 墓碑内同号再提交：仍是明确拒绝（COMMAND_RETIRED），绝不变成执行
+        replay = rig.gateway.submit_command(Command("d2", "rj-2", "blocking"))
+        self.assertEqual(replay.status, "rejected")
+        self.assertEqual(replay.reason.reason, R_COMMAND_RETIRED)
+        self.assertEqual(rig.executed, [])
+        self.assertTrue(rig.gateway.command_metrics().accounts_balanced())
+        report("被拒可查-容量有界且墓碑可区分",
+               {"rejected_submits": 5, "max_history": 2, "max_retired": 2,
+                "resubmit": "rj-2"},
+               "REJECTED 记录纳入 FIFO 保留窗 + 墓碑环；最老彻底遗忘回到 "
+               "NOT_FOUND；墓碑内同号再提交 COMMAND_RETIRED 拒绝",
+               {"history": m.history, "retired": m.retired,
+                "rj-0": forgotten.reason,
+                "rj-2": f"{tomb.state.value}(retired)", "replay": replay.reason.reason})
+
+    def test_rejected_command_not_cancellable_and_never_counts_as_success(self) -> None:
+        rig = BlockingRig(authz={"d1": frozenset({"blocking"}),
+                                 "d2": frozenset()})
+        rig.gateway.submit_command(Command("d2", "rej-x", "blocking"))
+        # 被拒指令是终态：取消得到明确 NOT_CANCELLABLE，状态不因此改变
+        c = rig.gateway.cancel_command("rej-x")
+        self.assertEqual(c.status, "rejected")
+        self.assertEqual(c.reason.reason, R_COMMAND_NOT_CANCELLABLE)
+        q = rig.gateway.query_command("rej-x")
+        self.assertEqual(q.state, CommandState.REJECTED)
+        # 对账：被拒指令绝不计入 accepted / succeeded
+        m = rig.gateway.command_metrics()
+        self.assertEqual(m.accepted, 0)
+        self.assertEqual(m.terminal.get("succeeded"), 0)
+        self.assertEqual(m.terminal.get("rejected"), 1)
+        self.assertEqual(m.rejected.get(R_COMMAND_UNAUTHORIZED), 1)
+        self.assertTrue(m.accounts_balanced())
+        report("被拒可查-不可取消且不计成功",
+               {"submit": "d2/blocking(未授权)", "then": "cancel rej-x"},
+               "REJECTED 为终态：取消 NOT_CANCELLABLE；"
+               "accepted/succeeded 均为 0，账平",
+               {"cancel": c.reason.reason, "state": q.state.value,
+                "metrics": m.to_dict()})
 
 
 class CancelTests(unittest.TestCase):
