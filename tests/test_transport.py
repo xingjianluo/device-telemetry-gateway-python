@@ -192,6 +192,52 @@ class TransportTests(unittest.TestCase):
         print(f"最终状态: missing=404, q-1={cancelled.json()['status']}, "
               f"running=409, metrics={metrics}")
 
+    def test_http_rejected_command_is_queryable_and_distinct_from_404(self) -> None:
+        client = build_client()
+        # 提交即拒：设备未被授权该指令（d2 已注册但授权集为空）
+        denied = client.post("/commands", json={
+            "device_id": "d2", "command_id": "http-rej-1", "name": "reboot"})
+        self.assertEqual(denied.status_code, 403)
+        self.assertEqual(denied.json()["error"]["reason"], "COMMAND_UNAUTHORIZED")
+
+        # 设备号不存在的提交即拒
+        unknown = client.post("/commands", json={
+            "device_id": "nope", "command_id": "http-rej-2", "name": "reboot"})
+        self.assertEqual(unknown.json()["error"]["reason"], "DEVICE_UNKNOWN")
+
+        # 事后凭号查询：200 + 明确 rejected 终态与可区分原因，而非 404
+        q1 = client.get("/commands/http-rej-1")
+        self.assertEqual(q1.status_code, 200)
+        body1 = q1.json()
+        self.assertEqual(body1["state"], "rejected")
+        self.assertEqual(body1["error"]["reason"], "COMMAND_UNAUTHORIZED")
+        q2 = client.get("/commands/http-rej-2")
+        self.assertEqual(q2.json()["state"], "rejected")
+        self.assertEqual(q2.json()["error"]["reason"], "DEVICE_UNKNOWN")
+        # 反复查询结论稳定一致
+        self.assertEqual(client.get("/commands/http-rej-1").json(), body1)
+        # 与“从未提交”严格区分：后者 404 + COMMAND_NOT_FOUND
+        missing = client.get("/commands/never-existed")
+        self.assertEqual(missing.status_code, 404)
+        self.assertEqual(missing.json()["error"]["reason"], "COMMAND_NOT_FOUND")
+        # 同号再次提交：403 但 duplicate=true，结论不变
+        again = client.post("/commands", json={
+            "device_id": "d2", "command_id": "http-rej-1", "name": "reboot"})
+        self.assertEqual(again.status_code, 403)
+        self.assertTrue(again.json()["duplicate"])
+        self.assertEqual(again.json()["error"]["reason"], "COMMAND_UNAUTHORIZED")
+
+        metrics = client.get("/metrics/commands").json()
+        self.assertTrue(metrics["accounts_balanced"])
+        self.assertEqual(metrics["accepted"], 0, "被拒指令绝不入队执行")
+        self.assertEqual(metrics["terminal"]["rejected"], 2)
+
+        print("\n用例: HTTP 提交即拒指令可查询且与 404 区分")
+        print("输入: d2 reboot(未授权) / nope reboot(设备不存在) / 同号重提")
+        print("判定依据: 提交即拒登记 rejected 终态；查询 200 带原因；从未提交 404")
+        print(f"最终状态: http-rej-1={body1}, http-rej-2=rejected, "
+              f"missing=404, metrics={metrics}")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

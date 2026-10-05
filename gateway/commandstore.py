@@ -25,7 +25,9 @@ class CommandState(str, Enum):
 
     QUEUED -> RUNNING -> SUCCEEDED | FAILED
     QUEUED -> CANCELLED            （仅“尚未开始执行”可取消）
-    后三者为终态，状态只进不退。
+    REJECTED                       （提交那一刻即被拒：未授权/设备不存在/积压超限等，
+                                    从未入队、从未执行）
+    后四者为终态，状态只进不退。
     """
 
     QUEUED = "queued"
@@ -33,10 +35,16 @@ class CommandState(str, Enum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    REJECTED = "rejected"
 
 
 TERMINAL_STATES = frozenset(
-    {CommandState.SUCCEEDED, CommandState.FAILED, CommandState.CANCELLED}
+    {
+        CommandState.SUCCEEDED,
+        CommandState.FAILED,
+        CommandState.CANCELLED,
+        CommandState.REJECTED,
+    }
 )
 
 
@@ -105,8 +113,9 @@ class BoundedCommandStore:
     不变量：
       * 非终态（QUEUED/RUNNING）记录绝不参与淘汰 —— 容量清理不会把还没结束
         的指令当成不存在；
-      * 终态记录按完成先后进入长度 max_history 的 FIFO 保留窗；超出即把最早的
-        终态记录降级为墓碑；墓碑环 max_retired 有界，超出后最早的墓碑彻底遗忘；
+      * 终态记录（含提交那一刻即被拒的 REJECTED）按完成先后进入长度
+        max_history 的 FIFO 保留窗；超出即把最早的终态记录降级为墓碑；
+        墓碑环 max_retired 有界，超出后最早的墓碑彻底遗忘；
       * 墓碑窗内的 command_id 再次提交一律 COMMAND_RETIRED 拒绝 —— 同一条指令
         不可能被重复执行；
       * 所有计数只在提交路径上每单恰好归类一次，保证
@@ -162,6 +171,38 @@ class BoundedCommandStore:
             "command accepted command_id=%s device=%s name=%s state=%s",
             command_id, device_id, name, CommandState.QUEUED.value,
         )
+        return record
+
+    def create_rejected(
+        self,
+        command_id: str,
+        device_id: str,
+        name: str,
+        reason: ParseError,
+    ) -> CommandRecord:
+        """登记一条 REJECTED 终态记录（提交那一刻即被拒、从未入队/执行）。
+
+        与 create_queued 的区别：不增加 accepted（拒绝计数由调用方完成），
+        记录从建立起就是终态，立即进入终态 FIFO 容量治理（保留窗 + 墓碑环），
+        因此被拒指令长期累积也不会无界增长。event 立即置位：该指令没有任何
+        在途执行，等待方（含并发同号提交）无需阻塞即可拿到确定结论。
+        """
+        record = CommandRecord(
+            command_id=command_id,
+            device_id=device_id,
+            name=name,
+            state=CommandState.REJECTED,
+            reason=reason,
+        )
+        self._records[command_id] = record
+        self._terminal[CommandState.REJECTED.value] += 1
+        self._finish_order.append(record.command_id)
+        logger.info(
+            "command terminal command_id=%s device=%s state=%s reason=%s",
+            command_id, device_id, CommandState.REJECTED.value, reason.reason,
+        )
+        self._evict_if_needed()
+        record.event.set()
         return record
 
     def retired_snapshot(self, command_id: str) -> CommandStatus | None:

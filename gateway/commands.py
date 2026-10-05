@@ -97,7 +97,10 @@ class CommandExecutor:
       * command_id 全局幂等 => 并发提交相同 command_id 只执行一次，无状态回退；
       * 队列长度有界 => 积压超限返回 COMMAND_QUEUE_FULL，不做无界堆积；
       * 指令状态进入 BoundedCommandStore：可凭 command_id 查询、可取消尚未
-        开始执行者、终态按 FIFO 有界保留并以墓碑防止二次执行。
+        开始执行者、终态按 FIFO 有界保留并以墓碑防止二次执行；
+      * 提交那一刻即被拒（设备不存在 / 未授权 / 积压超限）也登记一条 REJECTED
+        终态（带可区分原因），事后凭号可查、反复查一致，并与“从未提交”
+        （COMMAND_NOT_FOUND）明确区分；REJECTED 同样纳入保留窗/墓碑环治理。
     """
 
     def __init__(
@@ -216,47 +219,25 @@ class CommandExecutor:
 
     # ------------------------------------------------------------------
     def submit(self, command: Command) -> CommandResult:
-        """提交并阻塞至该指令被串行执行完毕（或被取消）。
+        """提交并阻塞至该指令被串行执行完毕（或被取消/被明确拒绝）。
 
         每个提交在锁内被归类为 accepted / duplicate / rejected 之一，对账恒平。
+        判定顺序：
+
+        1. 去重窗（活跃记录 + 终态保留窗 + 墓碑窗）：command_id 身份先于授权。
+           窗内同设备同号 -> duplicate，复用首个提交的确定结论（成功/失败/取消/
+           被拒都一样），绝不二次执行；窗内跨设备复用 -> COMMAND_DUPLICATE；
+           墓碑窗内重用 -> COMMAND_RETIRED。
+        2. 新指令号才做设备/授权/积压校验；任一不过即在**提交那一刻**登记一条
+           REJECTED 终态记录（带可区分原因），使其事后凭号可查、反复查结论一致，
+           并与“从未提交”（NOT_FOUND）明确区分。
         """
         device_id = command.device_id
         command_id = command.command_id
 
-        # 预校验（设备/授权）：不建立任何指令记录，仅计入提交与拒绝
+        # ---- 1) 去重窗判定（身份先于授权）：不建立任何新记录 ----
         with self._lock:
             self._store.count_submission()
-            allowed = self._auth.get(device_id)
-            if allowed is None:
-                self._store.count_rejection(R_DEVICE_UNKNOWN)
-                logger.info(
-                    "command reject command_id=%s input=device=%s name=%s reason=%s",
-                    command_id, device_id, command.name, R_DEVICE_UNKNOWN,
-                )
-                return _reject(
-                    command_id,
-                    ParseError(R_DEVICE_UNKNOWN,
-                               f"device {device_id!r} is not registered"),
-                )
-            if command.name not in allowed:
-                self._store.count_rejection(R_COMMAND_UNAUTHORIZED)
-                logger.info(
-                    "command reject command_id=%s input=device=%s name=%s reason=%s",
-                    command_id, device_id, command.name, R_COMMAND_UNAUTHORIZED,
-                )
-                return _reject(
-                    command_id,
-                    ParseError(
-                        R_COMMAND_UNAUTHORIZED,
-                        f"device {device_id!r} is not authorized for "
-                        f"{command.name!r}",
-                    ),
-                )
-
-        duplicate = False
-        record = None
-        with self._lock:
-            # 墓碑窗内复用：明确、可区分地拒绝，防止同一指令二次执行
             tomb = self._store.retired_snapshot(command_id)
             if tomb is not None:
                 self._store.count_rejection(R_COMMAND_RETIRED)
@@ -296,41 +277,67 @@ class CommandExecutor:
                         ),
                         device_id=record.device_id,
                     )
-                # 并发/重复提交：等待首个提交的结论，本调用不重复执行
+                # 并发/重复提交：等待首个提交的结论，本调用不重复执行/不重复判定。
+                # 对 REJECTED 终态同样成立——event 已置位，立即拿到稳定被拒结论。
                 self._store.count_duplicate()
                 event = record.event
                 duplicate = True
             else:
-                state = self._get_or_create_device_locked(device_id)
-                try:
-                    # Queue 自身有界：max_queue 个排队槽 + 1 个已出队在途槽，
-                    # 即有效积压口径“在途 + 排队 <= max_queue + 1”，超限即拒绝。
-                    state.queue.put_nowait(command)
-                except Full:
-                    self._store.count_rejection(R_COMMAND_QUEUE_FULL)
-                    logger.info(
-                        "command reject command_id=%s input=device=%s name=%s "
-                        "reason=%s limit=%d",
-                        command_id, device_id, command.name,
-                        R_COMMAND_QUEUE_FULL, self._max_queue,
-                    )
-                    return _reject(
-                        command_id,
-                        ParseError(
-                            R_COMMAND_QUEUE_FULL,
-                            f"backlog limit {self._max_queue} reached for "
-                            f"{device_id!r}",
-                        ),
-                        device_id=device_id,
-                    )
-                # 入队成功才建立状态（QUEUED）并计入 accepted
-                record = self._store.create_queued(command_id, device_id, command.name)
-                event = record.event
+                record = None
+                event = None
+                duplicate = False
+
+        if record is not None:
+            assert event is not None
+            event.wait()
+            with self._lock:
+                final = self._store.snapshot_record(record)
+            logger.info(
+                "command settled command_id=%s device=%s state=%s duplicate=%s",
+                command_id, final.device_id, final.state.value, duplicate,
+            )
+            return _status_to_result(final, duplicate=duplicate)
+
+        # ---- 2) 全新指令号：鉴权 + 积压校验；被拒即登记 REJECTED 终态 ----
+        with self._lock:
+            # 拿到锁后必须复查（阻塞期间可能有并发提交先登记了同号）
+            if self._store.get(command_id) is not None or \
+                    self._store.retired_snapshot(command_id) is not None:
+                # 极端竞争下退化为重新走一次提交路径，由其去重规则稳定归类
+                return self._resubmit_under_lock(command)
+
+            allowed = self._auth.get(device_id)
+            if allowed is None:
+                return self._reject_and_record(
+                    command, R_DEVICE_UNKNOWN,
+                    f"device {device_id!r} is not registered",
+                )
+            if command.name not in allowed:
+                return self._reject_and_record(
+                    command, R_COMMAND_UNAUTHORIZED,
+                    f"device {device_id!r} is not authorized for "
+                    f"{command.name!r}",
+                )
+
+            state = self._get_or_create_device_locked(device_id)
+            try:
+                # Queue 自身有界：max_queue 个排队槽 + 1 个已出队在途槽，
+                # 即有效积压口径“在途 + 排队 <= max_queue + 1”，超限即拒绝。
+                state.queue.put_nowait(command)
+            except Full:
+                return self._reject_and_record(
+                    command, R_COMMAND_QUEUE_FULL,
+                    f"backlog limit {self._max_queue} reached for "
+                    f"{device_id!r}",
+                    limit=self._max_queue,
+                )
+            # 入队成功才建立状态（QUEUED）并计入 accepted
+            record = self._store.create_queued(command_id, device_id, command.name)
+            event = record.event
 
         event.wait()
         # 用本地持有的记录对象取结论：即使该 id 已被淘汰出保留窗/墓碑窗，
         # 提交方仍能拿到自己这一单的确定结论（不依赖再次按 id 查表）。
-        assert record is not None
         with self._lock:
             final = self._store.snapshot_record(record)
         logger.info(
@@ -339,10 +346,71 @@ class CommandExecutor:
         )
         return _status_to_result(final, duplicate=duplicate)
 
+    def _reject_and_record(
+        self, command: Command, reason_code: str, detail: str,
+        limit: int | None = None,
+    ) -> CommandResult:
+        """在锁内：计入拒绝分类、登记 REJECTED 终态（可凭号查询、纳入容量治理）。"""
+        command_id = command.command_id
+        self._store.count_rejection(reason_code)
+        error = ParseError(reason_code, detail)
+        self._store.create_rejected(
+            command_id, command.device_id, command.name, error
+        )
+        logger.info(
+            "command reject command_id=%s input=device=%s name=%s reason=%s%s",
+            command_id, command.device_id, command.name, reason_code,
+            f" limit={limit}" if limit is not None else "",
+        )
+        return _reject(command_id, error, device_id=command.device_id)
+
+    def _resubmit_under_lock(self, command: Command) -> CommandResult:
+        """极端竞争兜底：阻塞期间同号已被他人登记，按窗内去重规则稳定归类。
+
+        调用方已计过一次 submitted，这里绝不重复计 submitted；只按既有记录/墓碑
+        给出 duplicate 或拒绝结论（与正常窗内路径的计数口径一致）。
+        """
+        command_id = command.command_id
+        tomb = self._store.retired_snapshot(command_id)
+        if tomb is not None:
+            self._store.count_rejection(R_COMMAND_RETIRED)
+            return _reject(
+                command_id,
+                ParseError(
+                    R_COMMAND_RETIRED,
+                    f"command_id {command_id!r} already completed "
+                    f"({tomb.state.value}) and retired from the retention window",
+                ),
+                device_id=tomb.device_id,
+            )
+        record = self._store.get(command_id)
+        assert record is not None
+        if record.device_id != command.device_id:
+            self._store.count_rejection(R_COMMAND_DUPLICATE)
+            return _reject(
+                command_id,
+                ParseError(
+                    R_COMMAND_DUPLICATE,
+                    "command_id already used by another device",
+                ),
+                device_id=record.device_id,
+            )
+        # 同设备同号：与正常 duplicate 路径一致，等待首个提交到达终态后复用，
+        # 绝不能在它还是 QUEUED 时提前给出快照。
+        self._store.count_duplicate()
+        event = record.event
+        event.wait()
+        return _status_to_result(self._store.snapshot_record(record), duplicate=True)
+
     # ------------------------------------------------------------------
     # ---- 指令状态查询 / 取消 / 对账 ----
     def query_status(self, command_id: str) -> CommandStatus | ParseError:
-        """凭指令号查询：同一 id 反复查询结论稳定一致；未提交过 -> NOT_FOUND。"""
+        """凭指令号查询：同一 id 反复查询结论稳定一致。
+
+        成功/失败/取消/提交即拒(REJECTED，含 DEVICE_UNKNOWN、COMMAND_UNAUTHORIZED、
+        COMMAND_QUEUE_FULL 等可区分原因) -> 终态快照；执行中 -> 当前状态；
+        从未提交（或已超出墓碑窗）-> ParseError(COMMAND_NOT_FOUND)。
+        """
         with self._lock:
             status = self._store.status(command_id)
         if status is None:
